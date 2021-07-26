@@ -3,6 +3,91 @@ struct CutSet
     succ::Dict{Int, BitSet}
 end
 
+"""
+    build_mst(graph::BaseGraph,
+              nodes::BitSet,
+              edges::BitSet)::Dict{Int, Array{Int, 1}}
+Builds a graph as an adjacency list from the `mst_nodes` and `mst_edges`.
+"""
+function build_mst(graph::BaseGraph, nodes::BitSet, edges::BitSet)::Dict{Int,Array{Int,1}}
+    mst = Dict{Int,Array{Int,1}}()
+    for node in nodes
+        mst[node] = Array{Int,1}()
+    end
+    for edge in edges
+        add_edge_to_mst!(graph, mst, edge)
+    end
+    return mst
+end
+
+"""
+    remove_edge_from_mst!(graph::BaseGraph,
+                          mst::Dict{Int, Array{Int,1}},
+                          edge::Int)
+Removes an edge from the graph built by `build_mst()`.
+"""
+function remove_edge_from_mst!(graph::BaseGraph, mst::Dict{Int,Array{Int,1}}, edge::Int)
+    filter!(e -> e != graph.edge_dst[edge], mst[graph.edge_src[edge]])
+    filter!(e -> e != graph.edge_src[edge], mst[graph.edge_dst[edge]])
+end
+
+"""
+    add_edge_to_mst!(graph::BaseGraph,
+                     mst::Dict{Int, Array{Int,1}},
+                     edge::Int)
+    Adds an edge to the graph built by `build_mst()`.
+"""
+function add_edge_to_mst!(graph::BaseGraph, mst::Dict{Int,Array{Int,1}}, edge::Int)
+    push!(mst[graph.edge_src[edge]], graph.edge_dst[edge])
+    push!(mst[graph.edge_dst[edge]], graph.edge_src[edge])
+end
+
+
+"""
+    traverse_mst(mst::Dict{Int, Array{Int, 1}},
+                 start_node::Int,
+                 avoid_node::Int,
+                 stack::Stack{Int},
+                 traversed_nodes::BitSet)::BitSet
+Returns the component of the MST `mst` that contains the vertex
+`start_node`.
+*Arguments:*
+    - mst:        mst to traverse
+    - start_node: the node to start traversing from
+    - avoid_node: the node to avoid adn which seperates the mst into
+                  two components
+    - stack:      an empty Stack
+    - traversed_nodes: an empty BitSet that is to be populated.
+`stack` and `traversed_nodes` are are pre-allocated and passed in to
+reduce the number of memory allocations and consequently, time taken.
+In the course of calling this function multiple times, it is intended that
+we pass in the same (empty) objects repeatedly.
+"""
+function traverse_mst(
+    mst::Dict{Int,Array{Int,1}},
+    start_node::Int,
+    avoid_node::Int,
+    stack::Stack{Int},
+    traversed_nodes::BitSet,
+)::BitSet
+    @assert isempty(stack)
+    empty!(traversed_nodes)
+
+    push!(stack, start_node)
+
+    while !isempty(stack)
+        new_node = pop!(stack)
+        push!(traversed_nodes, new_node)
+
+        for neighbor in mst[new_node]
+            if !(neighbor in traversed_nodes) && neighbor != avoid_node
+                push!(stack, neighbor)
+            end
+        end
+    end
+    return traversed_nodes
+end
+
 
 """
     sample_subgraph(graph::BaseGraph,
@@ -49,6 +134,7 @@ function bfs_traverse(mst::Dict{Int, Array{Int, 1}},
             end
         end
     end
+    return predecessors, successors
 end
 
 function memoized_balance_edges(graph::BaseGraph,
@@ -57,12 +143,12 @@ function memoized_balance_edges(graph::BaseGraph,
                                 pop_constraint::PopulationConstraint,
                                 D₁::Int,
                                 D₂::Int,
-                                subgraph_pop::Number)::CutSet
+                                subgraph_pop::Number)::Tuple{CutSet, Dict}
     node_pops = Dict(n => graph.populations[n] for n in mst_nodes)
     degrees = Dict(n => length(mst[n]) for n in mst_nodes)
     non_leaves = BitSet(filter(n -> degrees[n] > 1, mst_nodes))
     # if we can't find a root that has > degree 1, we'll start over
-    if isempty(non_leaves) return Set() end
+    if isempty(non_leaves) return Set(), Dict{Int64, Int64} end
     root = rand(non_leaves)
     pred, succ = bfs_traverse(mst, root)
     tree_pops = Dict{Int, Number}()
@@ -101,7 +187,7 @@ function memoized_balance_edges(graph::BaseGraph,
             balance_nodes[node] = pop
         end
     end
-    return CutSet(balance_nodes, succ)
+    return CutSet(balance_nodes, succ), pred
 end
 
 
@@ -241,15 +327,27 @@ function get_recom_proposal(graph::BaseGraph,
     subgraph_pop = partition.dist_populations[D₁] + partition.dist_populations[D₂]
 
     while true
-        mst = tree_fn(graph, sg_edges, [n for n in sg_nodes], rng)
+        mst_edges = tree_fn(graph, sg_edges, [n for n in sg_nodes], rng)
+        mst = build_mst(graph, sg_nodes, mst_edges)
+
         for _ in 1:node_repeats
             # see if we can get a population-balanced cut in this mst
-            cut_set = balance_edge_fn(graph, mst, sg_nodes,
+            cut_set, pred = balance_edge_fn(graph, mst, sg_nodes,
                                       pop_constraint, D₁, D₂, subgraph_pop)
             if length(cut_set.balance_nodes) > 0
                 # Choose a random balance node.
                 root = rand(rng, keys(cut_set.balance_nodes))
-                component₁ = component_nodes(cut_set, root)
+                # component₁ = component_nodes(cut_set, root)
+                # TODO - restore performant version. This will rereun the separation
+                stack = Stack{Int}()
+                component_container = BitSet([])
+                component₁ = traverse_mst(
+                    mst,
+                    pred[root],
+                    root,
+                    stack,
+                    component_container
+                )
                 pop₁ = cut_set.balance_nodes[root]
                 component₂ = setdiff(sg_nodes, component₁)
                 pop₂ = subgraph_pop - pop₁ 
@@ -286,8 +384,8 @@ function update_partition!(partition::Partition,
     partition.dist_nodes[proposal.D₁] = proposal.D₁_nodes
     partition.dist_nodes[proposal.D₂] = proposal.D₂_nodes
 
-    update_partition_adjacency!(partition, graph)
-    update_partition_weight!(partition, weight)
+    update_partition_adjacency(partition, graph)
+    # update_partition_weight(partition, weight)
 end
 
 @resumable function recom_iterator(
@@ -342,7 +440,7 @@ function get_reversible_recom_proposal(
     sg_nodes = union(partition.dist_nodes[D₁], partition.dist_nodes[D₂])
     sg_edges = induced_subgraph_edges(graph, collect(sg_nodes))
     mst = tree_fn(graph, sg_edges, collect(sg_nodes), rng)
-    cut_set = balance_edge_fn(graph, mst, sg_nodes,
+    cut_set, pred = balance_edge_fn(graph, mst, sg_nodes,
                               pop_constraint, D₁, D₂, subgraph_pop)
     n_proposals = length(cut_set.balance_nodes)
     if n_proposals > M
